@@ -1,0 +1,9 @@
+[contract]
+id = "robonix/primitive/gnss/fix"
+version = "1"
+kind = "primitive"
+idl = "common_interfaces/sensor_msgs/msg/NavSatFix.msg"
+description = "GNSS position fix from the BT-982G1 receiver; only valid positions are published."
+
+[mode]
+type = "topic_out"

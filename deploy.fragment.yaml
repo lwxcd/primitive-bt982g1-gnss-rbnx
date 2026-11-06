@@ -1,0 +1,13 @@
+# Merge into an existing deployment. Keep this disabled until the receiver is
+# connected: Soma treats a provider activation failure as fatal.
+primitive:
+  - name: bt982g1_gnss
+    path: ./primitives/primitive-bt982g1-gnss-rbnx
+    config:
+      serial:
+        port: /dev/rtk
+        baud: 115200
+      # ntrip:
+      #   enabled: true
+      #   env_file: "~/.config/rtk_imu/ntrip.env"
+      frame_id: gnss_link
