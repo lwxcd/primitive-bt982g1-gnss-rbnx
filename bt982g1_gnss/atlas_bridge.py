@@ -14,7 +14,7 @@ from robonix_api import Err, Ok, Primitive
 from .config import parse_config, resolve_port
 from .ntrip import NtripClient, NtripStatus, config_from_env, load_env
 from .receiver import Receiver
-from .status import build_status
+from .status import build_status, position_covariance
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +85,7 @@ def activate():
     from rclpy.context import Context
     from rclpy.executors import SingleThreadedExecutor
     from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from geometry_msgs.msg import TwistStamped
     from sensor_msgs.msg import NavSatFix, NavSatStatus
     from std_msgs.msg import String
 
@@ -100,25 +101,71 @@ def activate():
     seen = set()
     ready = False
 
-    def publish_fix(info):
+    def publish_fix(info, stamp=None):
         try:
             message = NavSatFix()
-            message.header.stamp = node.get_clock().now().to_msg()
+            message.header.stamp = (node.get_clock().now().to_msg()
+                                    if stamp is None else stamp)
             message.header.frame_id = frame_id
             message.status.service = NavSatStatus.SERVICE_GPS
-            message.status.status = NavSatStatus.STATUS_FIX
+            quality = info.get("quality")
+            message.status.status = (NavSatStatus.STATUS_GBAS_FIX
+                                     if quality in (2, 4, 5)
+                                     else NavSatStatus.STATUS_FIX)
             message.latitude = float(info["lat"])
             message.longitude = float(info["lon"])
             message.altitude = float(info["alt"]) if info["alt"] is not None else 0.0
+            covariance = position_covariance(
+                receiver.sigma_for(info.get("utc_time")) if receiver is not None else None)
             message.position_covariance_type = NavSatFix.COVARIANCE_TYPE_UNKNOWN
+            if covariance is not None:
+                message.position_covariance[0] = covariance[0]
+                message.position_covariance[4] = covariance[1]
+                message.position_covariance[8] = covariance[2]
+                message.position_covariance_type = NavSatFix.COVARIANCE_TYPE_DIAGONAL_KNOWN
             fix_publisher.publish(message)
+            if receiver is not None:
+                receiver.record_fix_stamp(message.header.stamp)
         except Exception as exc:  # noqa: BLE001
             log.warning("fix publish failed: %s", exc)
+
+    def publish_velocity(info):
+        try:
+            message = TwistStamped()
+            message.header.stamp = node.get_clock().now().to_msg()
+            message.header.frame_id = "gnss_enu"
+            message.twist.linear.x = float(info["east_mps"])
+            message.twist.linear.y = float(info["north_mps"])
+            velocity_publisher.publish(message)
+            if receiver is not None:
+                receiver.record_velocity_stamp(message.header.stamp)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("velocity publish failed: %s", exc)
 
     def on_fix_sample(message):
         if math.isfinite(message.latitude) and math.isfinite(message.longitude) \
                 and message.status.status >= 0:
             seen.add("fix")
+
+    def on_velocity_sample(message):
+        if message.header.frame_id == "gnss_enu" and all(
+                math.isfinite(value) for value in
+                (message.twist.linear.x, message.twist.linear.y)):
+            seen.add("velocity")
+
+    def on_sigma(_info):
+        # Late GST republishes the same fix stamp with covariance; it is not a new fix.
+        if receiver is None:
+            return
+        info, stamp = receiver.latest_fix()
+        if info is None or stamp is None:
+            return
+        if receiver.sigma_for(info.get("utc_time")) is None:
+            return
+        from builtin_interfaces.msg import Time
+        header_stamp = Time()
+        header_stamp.sec, header_stamp.nanosec = stamp
+        publish_fix(info, header_stamp)
 
     def on_status_sample(message):
         try:
@@ -151,11 +198,17 @@ def activate():
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         fix_publisher = node.create_publisher(NavSatFix, config["topics"]["fix"], qos)
         status_publisher = node.create_publisher(String, config["topics"]["rtk_status"], qos)
+        velocity_publisher = node.create_publisher(
+            TwistStamped, config["topics"]["velocity"], qos)
         node.create_subscription(NavSatFix, config["topics"]["fix"], on_fix_sample, qos)
         node.create_subscription(String, config["topics"]["rtk_status"], on_status_sample, qos)
+        node.create_subscription(TwistStamped, config["topics"]["velocity"],
+                                 on_velocity_sample, qos)
 
         receiver = Receiver(port, config["serial"]["baud"], config["serial"]["init_commands"],
-                            publish_fix, log.info)
+                            publish_fix, log.info,
+                            on_velocity=publish_velocity, on_sigma=on_sigma,
+                            velocity_source=config["velocity_source"])
         receiver.start()
         ntrip = config["ntrip"]
         if ntrip["enabled"]:
@@ -177,11 +230,15 @@ def activate():
 
         # Only samples received after the serial link and status loop start count.
         seen.clear()
+        required = {"fix", "status"}
+        if config["require_velocity"]:
+            required.add("velocity")
         deadline = time.monotonic() + config["sentinel_timeout_s"]
-        while len(seen) < 2 and time.monotonic() < deadline:
+        while not required.issubset(seen) and time.monotonic() < deadline:
             executor.spin_once(timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())))
-        if len(seen) != 2:
-            return Err("No fresh BT-982G1 GNSS fix/status samples; check the serial port, "
+        if not required.issubset(seen):
+            missing = ", ".join(sorted(required - seen))
+            return Err(f"No fresh BT-982G1 GNSS samples ({missing}); check the serial port, "
                        "receiver output, antenna sky view and NTRIP settings")
         for key, topic in config["topics"].items():
             if declared_topics is None:

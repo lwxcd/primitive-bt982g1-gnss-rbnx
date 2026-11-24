@@ -7,7 +7,12 @@ primitive:
       serial:
         port: /dev/rtk
         baud: 115200
+        init_commands: ["MODE ROVER", "GNGGA 1", "GNRMC 1", "GNGST 1"]
       # ntrip:
       #   enabled: true
       #   env_file: "~/.config/rtk_imu/ntrip.env"
       frame_id: gnss_link
+      # Set true when feeding service-localization-outdoor-rbnx.
+      require_velocity: true
+      # auto: RTK-fixed GGA position differencing, RMC when no fixed baseline.
+      velocity_source: auto

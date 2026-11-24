@@ -1,0 +1,8 @@
+[contract]
+id = "robonix/primitive/gnss/velocity"
+version = "1"
+kind = "primitive"
+idl = "common_interfaces/geometry_msgs/msg/TwistStamped.msg"
+description = "Receiver-reported ground velocity in local ENU: frame gnss_enu, linear.x=east, linear.y=north (m/s), from validated RMC true track."
+[mode]
+type = "topic_out"

@@ -9,6 +9,7 @@ import re
 TOPICS = {
     "fix": "/gps/fix",
     "rtk_status": "/gps/rtk_status",
+    "velocity": "/gps/velocity",
 }
 NTRIP_DEFAULT_ENV = "~/.config/rtk_imu/ntrip.env"
 PL2303G_VID = 0x067B
@@ -20,7 +21,8 @@ def parse_config(cfg):
     if not isinstance(cfg, dict):
         raise ValueError("Configuration must be an object")
     unknown = set(cfg) - {"serial", "ntrip", "frame_id", "status_rate_hz",
-                          "sentinel_timeout_s", "topics"}
+                          "sentinel_timeout_s", "require_velocity", "velocity_source",
+                          "topics"}
     if unknown:
         raise ValueError(f"Unknown config keys: {sorted(unknown)}")
     serial = _serial(cfg.get("serial", {}))
@@ -34,6 +36,12 @@ def parse_config(cfg):
     timeout = cfg.get("sentinel_timeout_s", 30.0)
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 120:
         raise ValueError("sentinel_timeout_s must be in (0,120] seconds")
+    require_velocity = cfg.get("require_velocity", False)
+    if not isinstance(require_velocity, bool):
+        raise ValueError("require_velocity must be boolean")
+    velocity_source = cfg.get("velocity_source", "rmc")
+    if velocity_source not in ("rmc", "position_diff", "auto"):
+        raise ValueError("velocity_source must be rmc, position_diff or auto")
     topics = cfg.get("topics", {})
     if not isinstance(topics, dict) or set(topics) - set(TOPICS):
         raise ValueError("Unknown topics key")
@@ -45,6 +53,7 @@ def parse_config(cfg):
         raise ValueError("Each stream must use a distinct topic")
     return {"serial": serial, "ntrip": ntrip, "frame_id": frame,
             "status_rate_hz": float(rate), "sentinel_timeout_s": float(timeout),
+            "require_velocity": require_velocity, "velocity_source": velocity_source,
             "topics": topics}
 
 

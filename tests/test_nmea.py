@@ -9,6 +9,7 @@ RMC = "$GNRMC,023034.00,A,3112.38608,N,12127.29727,E,0.514,45.0,061126,,,A*7F"
 VTG = "$GNVTG,45.0,T,,M,1.852,N,3.704,K,A*2C"
 THS = "$GPTHS,90.5,A*0B"
 TRA = "$GPTRA,91.2,1.5,0.2,*42"
+GST = "$GNGST,023034.00,0.8,0.5,0.3,32.6,0.6,0.4,0.9*7D"
 
 
 def test_checksum_accepts_valid_and_rejects_corrupt():
@@ -25,6 +26,8 @@ def test_parse_gga_rtk_fixed():
     assert info["hdop"] == 0.6
     assert info["diff_age"] == 1.2
     assert info["alt"] == 12.345
+    assert info["utc_time"] == "023034.00"
+    assert info["epoch_s"] == 2 * 3600 + 30 * 60 + 34.0
     assert math.isclose(info["lat"], 31 + 12.38608 / 60, abs_tol=1e-9)
     assert math.isclose(info["lon"], 121 + 27.29727 / 60, abs_tol=1e-9)
 
@@ -40,11 +43,16 @@ def test_parse_gga_rejects_other_sentence():
     assert nmea.parse_gga("garbage") is None
 
 
-def test_parse_rmc_speed_and_course():
+def test_parse_rmc_speed_course_and_enu():
     info = nmea.parse_rmc(RMC)
     assert info["status"] == "A"
-    assert math.isclose(info["speed_mps"], 0.514 * 0.514444, abs_tol=1e-9)
+    assert info["valid"] is True
+    assert info["utc_time"] == "023034.00"
+    speed = 0.514 * 0.514444
+    assert math.isclose(info["speed_mps"], speed, abs_tol=1e-9)
     assert info["course_deg"] == 45.0
+    assert math.isclose(info["east_mps"], speed * math.sin(math.radians(45.0)), abs_tol=1e-9)
+    assert math.isclose(info["north_mps"], speed * math.cos(math.radians(45.0)), abs_tol=1e-9)
 
 
 def test_parse_rmc_invalid_status_clears_velocity():
@@ -54,7 +62,45 @@ def test_parse_rmc_invalid_status_clears_velocity():
     for char in body:
         checksum ^= ord(char)
     info = nmea.parse_rmc(f"${body}*{checksum:02X}")
-    assert info == {"status": "V", "speed_mps": None, "course_deg": None}
+    assert info["status"] == "V"
+    assert info["valid"] is False
+    assert info["speed_mps"] is None
+    assert info["course_deg"] is None
+    assert info["east_mps"] is None
+
+
+def test_parse_rmc_no_fix_mode_is_invalid():
+    body = "GNRMC,023034.00,A,3112.38608,N,12127.29727,E,0.514,45.0,061126,,,N"
+    checksum = 0
+    for char in body:
+        checksum ^= ord(char)
+    info = nmea.parse_rmc(f"${body}*{checksum:02X}")
+    assert info["valid"] is False
+
+
+def test_parse_gst_sigmas():
+    info = nmea.parse_gst(GST)
+    assert info["utc_time"] == "023034.00"
+    assert info["latitude_sigma_m"] == 0.6
+    assert info["longitude_sigma_m"] == 0.4
+    assert info["altitude_sigma_m"] == 0.9
+
+
+def test_parse_gst_rejects_zero_and_other_sentences():
+    body = "GNGST,023034.00,0.8,0.5,0.3,32.6,0.0,0.4,0.9"
+    checksum = 0
+    for char in body:
+        checksum ^= ord(char)
+    assert nmea.parse_gst(f"${body}*{checksum:02X}") is None
+    assert nmea.parse_gst(GGA_FIXED) is None
+
+
+def test_utc_seconds_validation():
+    assert nmea.utc_seconds("023034.00") == 2 * 3600 + 30 * 60 + 34.0
+    assert nmea.utc_seconds("") is None
+    assert nmea.utc_seconds("246000.00") is None
+    assert nmea.utc_seconds("026000.00") is None
+    assert nmea.utc_seconds("023460.00") == 2 * 3600 + 34 * 60 + 60.0
 
 
 def test_parse_vtg_speed():

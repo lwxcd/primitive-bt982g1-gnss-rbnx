@@ -2,6 +2,7 @@
 """NMEA 0183 parsing shared by the BT-982G1 receiver and its tests."""
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 FIX_NAMES = {
@@ -12,6 +13,18 @@ FIX_NAMES = {
     4: "RTK fixed",
     5: "RTK float",
     6: "dead reckoning",
+}
+
+STATE_NAMES = {
+    0: "NO_FIX",
+    1: "SINGLE",
+    2: "DGPS",
+    3: "PPS",
+    4: "RTK_FIXED",
+    5: "RTK_FLOAT",
+    6: "DEAD_RECKONING",
+    7: "MANUAL",
+    8: "SIMULATION",
 }
 
 
@@ -27,6 +40,20 @@ def _int(text: str) -> Optional[int]:
         return int(text)
     except (TypeError, ValueError):
         return None
+
+
+def utc_seconds(text: Optional[str]) -> Optional[float]:
+    """NMEA hhmmss.ss to seconds of day; None when malformed."""
+    if not isinstance(text, str) or len(text) < 6 or not text[:6].isdigit():
+        return None
+    try:
+        hour, minute, second = int(text[:2]), int(text[2:4]), float(text[4:])
+    except ValueError:
+        return None
+    if not (0 <= hour < 24 and 0 <= minute < 60 and math.isfinite(second)
+            and 0 <= second < 61):
+        return None
+    return hour * 3600 + minute * 60 + second
 
 
 def checksum_ok(line: str) -> bool:
@@ -74,6 +101,7 @@ def parse_gga(line: str) -> Optional[dict]:
     fields = sentence_fields(line)
     if fields is None or len(fields) < 10 or fields[0][-3:] != "GGA":
         return None
+    utc_time = fields[1] or None
     return {
         "quality": _int(fields[6] or "0") or 0,
         "sats": _int(fields[7] or "0") or 0,
@@ -82,6 +110,8 @@ def parse_gga(line: str) -> Optional[dict]:
         "lon": coordinate(fields[4], fields[5]) if fields[4] else None,
         "alt": _float(fields[9]),
         "diff_age": _float(fields[13]) if len(fields) > 13 else None,
+        "utc_time": utc_time,
+        "epoch_s": utc_seconds(utc_time),
     }
 
 
@@ -90,15 +120,51 @@ def parse_rmc(line: str) -> Optional[dict]:
     if fields is None or len(fields) < 9 or fields[0][-3:] != "RMC":
         return None
     status = fields[2].strip().upper()
-    if status != "A":
-        return {"status": status, "speed_mps": None, "course_deg": None}
+    utc_time = fields[1] or None
+    mode = fields[12].strip().upper() if len(fields) > 12 else ""
+    if status != "A" or mode == "N":
+        return {"status": status, "valid": False, "utc_time": utc_time,
+                "epoch_s": None, "speed_mps": None, "course_deg": None,
+                "east_mps": None, "north_mps": None}
     knots = _float(fields[7])
     course = _float(fields[8])
+    epoch = utc_seconds(utc_time)
+    valid = knots is not None and math.isfinite(knots) and knots >= 0 and epoch is not None
+    if course is not None and (not math.isfinite(course) or not 0.0 <= course < 360.0):
+        course = None
+    if valid and course is None and knots != 0:
+        valid = False
+    speed_mps = None if knots is None else knots * 0.514444
+    east = north = None
+    if valid:
+        angle = math.radians(course or 0.0)
+        east = speed_mps * math.sin(angle)
+        north = speed_mps * math.cos(angle)
     return {
         "status": status,
-        "speed_mps": None if knots is None else knots * 0.514444,
+        "valid": valid,
+        "utc_time": utc_time,
+        "epoch_s": epoch,
+        "speed_mps": speed_mps,
         "course_deg": course,
+        "east_mps": east,
+        "north_mps": north,
     }
+
+
+def parse_gst(line: str) -> Optional[dict]:
+    """Receiver-estimated position sigmas; never derived from HDOP."""
+    fields = sentence_fields(line)
+    if fields is None or len(fields) < 9 or fields[0][-3:] != "GST":
+        return None
+    utc_time = fields[1] or None
+    epoch = utc_seconds(utc_time)
+    values = [_float(fields[6]), _float(fields[7]), _float(fields[8])]
+    if epoch is None or any(v is None or not math.isfinite(v) or v <= 0.0 for v in values):
+        return None
+    return {"utc_time": utc_time, "epoch_s": epoch,
+            "latitude_sigma_m": values[0], "longitude_sigma_m": values[1],
+            "altitude_sigma_m": values[2]}
 
 
 def parse_vtg(line: str) -> Optional[dict]:

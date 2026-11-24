@@ -324,6 +324,34 @@ class NtripClient(threading.Thread):
         self.log = log
         self.reconnect_s = reconnect_s
         self.gga_interval_s = gga_interval_s
+        self.rtcm_types = {}
+        self.rtcm_buf = bytearray()
+        self.rtcm_log_at = 0.0
+
+    def _count_rtcm(self, data: bytes) -> None:
+        self.rtcm_buf.extend(data)
+        buf = self.rtcm_buf
+        i = 0
+        while i + 6 <= len(buf):
+            if buf[i] != 0xD3:
+                i += 1
+                continue
+            length = ((buf[i + 1] & 0x03) << 8) | buf[i + 2]
+            if i + 3 + length + 3 > len(buf):
+                break
+            payload = bytes(buf[i + 3:i + 3 + length])
+            if len(payload) >= 2:
+                mt = (payload[0] << 4) | (payload[1] >> 4)
+                self.rtcm_types[mt] = self.rtcm_types.get(mt, 0) + 1
+            i += 3 + length + 3
+        if i:
+            del buf[:i]
+        now = time.monotonic()
+        if now - self.rtcm_log_at >= 20.0:
+            self.rtcm_log_at = now
+            if self.rtcm_types:
+                summary = " ".join("%d:%d" % (k, v) for k, v in sorted(self.rtcm_types.items()))
+                self.log("ntrip: rtcm message types " + summary)
 
     def run(self) -> None:
         while not self.stop.is_set():
@@ -367,6 +395,7 @@ class NtripClient(threading.Thread):
             if rest:
                 payload = decoder.feed(rest) if decoder else rest
                 if payload:
+                    self._count_rtcm(payload)
                     self.status.add_rtcm(len(payload), self.write(payload))
             while not self.stop.is_set():
                 now = time.monotonic()
@@ -387,6 +416,7 @@ class NtripClient(threading.Thread):
                     raise ConnectionError("caster closed the stream")
                 payload = decoder.feed(data) if decoder else data
                 if payload:
+                    self._count_rtcm(payload)
                     self.status.add_rtcm(len(payload), self.write(payload))
         finally:
             try:

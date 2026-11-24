@@ -7,7 +7,8 @@ from bt982g1_gnss import ntrip
 
 def test_defaults_match_outdoor_mapping_dependency():
     parsed = cfg.parse_config({})
-    assert parsed["topics"] == {"fix": "/gps/fix", "rtk_status": "/gps/rtk_status"}
+    assert parsed["topics"] == {"fix": "/gps/fix", "rtk_status": "/gps/rtk_status",
+                                "velocity": "/gps/velocity"}
     assert parsed["serial"]["port"] == "auto"
     assert parsed["serial"]["baud"] == 115200
     assert parsed["serial"]["init_commands"] == ["MODE ROVER"]
@@ -15,15 +16,22 @@ def test_defaults_match_outdoor_mapping_dependency():
     assert parsed["frame_id"] == "gnss_link"
     assert parsed["status_rate_hz"] == 1.0
     assert parsed["sentinel_timeout_s"] == 30.0
+    assert parsed["require_velocity"] is False
+    assert parsed["velocity_source"] == "rmc"
 
 
 def test_explicit_port_and_topics():
     parsed = cfg.parse_config({
         "serial": {"port": "/dev/rtk", "baud": 460800},
         "topics": {"fix": "/rtk/fix"},
+        "require_velocity": True,
+        "velocity_source": "auto",
     })
     assert parsed["serial"]["port"] == "/dev/rtk"
-    assert parsed["topics"] == {"fix": "/rtk/fix", "rtk_status": "/gps/rtk_status"}
+    assert parsed["topics"] == {"fix": "/rtk/fix", "rtk_status": "/gps/rtk_status",
+                                "velocity": "/gps/velocity"}
+    assert parsed["require_velocity"] is True
+    assert parsed["velocity_source"] == "auto"
 
 
 @pytest.mark.parametrize("payload", [
@@ -39,6 +47,9 @@ def test_explicit_port_and_topics():
     {"serial": {"init_commands": "MODE ROVER"}},
     {"ntrip": {"enabled": "yes"}},
     {"ntrip": {"reconnect_s": 0}},
+    {"require_velocity": "yes"},
+    {"velocity_source": "doppler"},
+    {"velocity_source": None},
     {"unknown": 1},
 ])
 def test_invalid_config_rejected(payload):

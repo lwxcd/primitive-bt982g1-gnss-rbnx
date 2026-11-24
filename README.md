@@ -1,8 +1,9 @@
 # BT-982G1 GNSS/RTK 原语
 
 把 Unicore BT-982G1（UM982 协议）双天线接收机接入 Robonix。原语独占一个串口，
-解析 NMEA GGA/RMC/VTG 与双天线 THS/TRA，可选通过 NTRIP 注入 RTCM 差分改正，
-发布标准 `robonix/primitive/gnss/fix` 与包内定义的 `rtk_status`。
+解析 NMEA GGA/RMC/VTG/GST 与双天线 THS/TRA，可选通过 NTRIP 注入 RTCM 差分改正，
+发布标准 `robonix/primitive/gnss/fix`、包内定义的 `rtk_status`，以及
+`robonix/primitive/gnss/velocity`（默认 RMC 地速，可选 RTK 固定解位置差，ENU）。
 NMEA/NTRIP 逻辑取自本仓库原有的 `scripts/rtk_imu/{rover_status,ntrip_client}.py`
 台架脚本，去掉了 IMU 串口、网页仪表盘和 CSV 记录。
 
@@ -14,6 +15,12 @@ NMEA/NTRIP 逻辑取自本仓库原有的 `scripts/rtk_imu/{rover_status,ntrip_c
 - `service-navigation-outdoor-rbnx`（`outdoor_execution`）**不直接消费 GNSS**。
   它需要独立定位服务提供 `robonix/service/localization/{odom,status}`；本原语
   不能替代该服务，也不能单独满足导航执行的生命周期依赖。
+- `service-localization-outdoor-rbnx` 消费 GNSS 的 `fix`、`rtk_status`、
+  `velocity` 与 WIT IMU 的五条原语契约。本包补齐了该服务的 GNSS 输入，但定位
+  服务仍要求显式 `origin`、IMU 安装/北向/质量确认，以及
+  `velocity_accuracy_confirmed`/`velocity_accuracy_mps`——RMC 本身不带速度精度，
+  原语不会伪造。位置协方差必须来自 GST；未启用或无有效 GST 时定位服务会拒绝。
+  另需在接收机初始化命令中启用 `GNGST 1`（见下方部署示例）。
 - 与 WIT IMU 原语互不冲突：WIT 使用 CP2102 串口和 9600 波特率，本接收机使用
   PL2303G 的 `/dev/rtk` 和 115200 波特率。
 
@@ -45,13 +52,15 @@ primitive:
       serial:
         port: /dev/rtk
         baud: 115200
-        init_commands: ["MODE ROVER"]
+        init_commands: ["MODE ROVER", "GNGGA 1", "GNRMC 1", "GNGST 1"]
       ntrip:
         enabled: true
         env_file: "~/.config/rtk_imu/ntrip.env"
       frame_id: gnss_link
-      status_rate_hz: 1.0
+      status_rate_hz: 2.0      # 配合 1 Hz NMEA；定位服务 sensor_timeout_s 建议 >= 2.0
       sentinel_timeout_s: 30.0
+      require_velocity: true   # 供定位服务使用时要求速度流
+      velocity_source: auto    # 固定解用 GGA 位置差，否则回退 RMC
 ```
 
 实例身份来自 `RBNX_INSTANCE_NAME`，默认 `bt982g1_gnss`，必须与
@@ -68,7 +77,7 @@ primitive 条目注释掉（空挂），恢复后取消注释并重启整栈。
 | `serial.port` | `auto` | `auto` 先找 `/dev/rtk`，再按 USB VID/PID 唯一匹配；也可写绝对路径 |
 | `serial.baud` | `115200` | 必须与接收机一致 |
 | `serial.usb_vid` / `usb_pid` | `0x067B` / `0x23A3` | 仅 `port: auto` 使用，两项须同时给出 |
-| `serial.init_commands` | `["MODE ROVER"]` | 每次打开串口后按 CRLF 发送；`[]` 表示不配置接收机 |
+| `serial.init_commands` | `["MODE ROVER"]` | 每次打开串口后按 CRLF 发送；`[]` 表示不配置接收机。定位服务需要额外启用 `GNGGA 1`、`GNRMC 1`、`GNGST 1` |
 | `ntrip.enabled` | `true` | 凭据不全时只跑单点，不阻塞激活 |
 | `ntrip.env_file` | `~/.config/rtk_imu/ntrip.env` | NTRIP 凭据文件 |
 | `ntrip.reconnect_s` | `10.0` | 断线重连间隔 |
@@ -76,8 +85,11 @@ primitive 条目注释掉（空挂），恢复后取消注释并重启整栈。
 | `frame_id` | `gnss_link` | fix 的坐标系；本包不发布 TF |
 | `status_rate_hz` | `1.0` | 状态 JSON 发布频率，范围 (0,20] |
 | `sentinel_timeout_s` | `30.0` | 激活时等待首个有效 fix 与状态的上限 |
+| `require_velocity` | `false` | 为 `true` 时激活还要求收到有限 ENU 速度；定位服务应设为 `true` |
+| `velocity_source` | `rmc` | `rmc` 用接收机 RMC 地速；`position_diff` 用两条 RTK 固定解 GGA 的位置差（0.5–1.5 s 基线、目标 1.0 s），无基线则不发布、不回退；`auto` 优先位置差、固定解窗口外回退 RMC |
 | `topics.fix` | `/gps/fix` | NavSatFix |
 | `topics.rtk_status` | `/gps/rtk_status` | JSON String |
+| `topics.velocity` | `/gps/velocity` | TwistStamped（`gnss_enu`，x=东、y=北） |
 
 完整语义见 `CONTRACTS.md`。
 
@@ -114,12 +126,23 @@ NTRIP_HOST_HEADER=
 
 ## 话题与生命周期
 
-- `fix`：仅在 quality>0 且经纬度有效时发布，`status.status = 0`，协方差未知。
-- `rtk_status`：周期发布 JSON，字段包括 `receiver_quality`、`fix_age_s`、
-  `measurement_age_s`、`valid`、卫星/HDOP/差分龄期、速度/航迹角、双天线航向
-  （仅诊断）、NTRIP 计数器。
-- ACTIVATE 期间原语订阅自己发布的两个话题，必须同时收到有效 NavSatFix 和含实际
-  测量龄期的状态才注册能力；否则返回错误并清理串口与线程。
+- `fix`：仅在 quality>0 且经纬度有效时发布；差分/RTK 质量置
+  `status.status = STATUS_GBAS_FIX`，其余置 `STATUS_FIX`。收到同 UTC 的 GST 后，
+  用接收机 sigma 的平方填充对角协方差并重发同一 header stamp；没有有效 GST 时
+  保持 `COVARIANCE_TYPE_UNKNOWN`，绝不从 HDOP 推算。
+- `rtk_status`：周期发布 JSON，包含 G70 兼容字段：`state`、`receiver_quality`、
+  `rtk_fixed`、`fix_stamp_s`、`utc_time`、`differential_age_s`、`satellites`、
+  卫星/HDOP/龄期、带 `source/fresh/age_s/utc_time/stamp_s/reference_frame/
+  covariance_known` 的 `velocity` 对象、双天线航向（仅诊断）、NTRIP 计数器。
+  `fix_stamp_s` 与最近一次 `fix` 的 header stamp 精确一致；`velocity.stamp_s`
+  与 `/gps/velocity` 的 header stamp 精确一致，供定位服务按时间戳关联。
+- `velocity`：`header.frame_id = gnss_enu`，`linear.x = 东速`、`linear.y = 北速`
+  （m/s）。默认来自校验通过的 RMC 地速/真航迹，相同 UTC 的重复 RMC 不刷新测量
+  时间；`velocity_source: position_diff`/`auto` 下可由两条 RTK 固定解 GGA 的位置差
+  给出（`rtk_status.velocity.source = POSITION_DIFF`），无合格基线时不发布或回退。
+  两种来源都不提供虚假精度；VTG 只更新状态 JSON 中的诊断速度。
+- ACTIVATE 期间原语订阅自己发布的 fix/status（以及 `require_velocity=true` 时的
+  velocity）话题，必须收到有效样本才注册能力；否则返回错误并清理串口与线程。
 - DEACTIVATE/SHUTDOWN 停止 NTRIP 客户端、接收线程和状态线程，关闭串口与 rclpy
   context。
 - 不发布 TF、odom 或独立航向能力。
